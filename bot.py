@@ -15,6 +15,12 @@ import math
 
 load_dotenv()
 
+# 네트워크 장애 감지 및 자동 일시중지 설정
+NETWORK_FAILURES = 0
+NETWORK_FAILURE_THRESHOLD = int(os.getenv('NETWORK_FAILURE_THRESHOLD', '6'))
+NETWORK_PAUSE_SLEEP_SECS = int(os.getenv('NETWORK_PAUSE_SLEEP_SECS', '60'))
+PAUSE_TRADING_ON_NETWORK = False
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -123,16 +129,46 @@ def send_discord_notification(message: str, color: int = 3447003):
 
 
 def with_retry(fn, *args, retries=3, backoff_factor=0.5, **kwargs):
-    """간단한 재시도 래퍼: 네트워크 오류가 발생하면 지수형 백오프 후 재시도합니다."""
+    """재시도 래퍼: 네트워크/TLS 오류를 감지해 백오프 후 재시도하고, 연속 오류가 많으면 전체 트레이딩을 일시중지합니다."""
+    global NETWORK_FAILURES, PAUSE_TRADING_ON_NETWORK
     attempt = 0
     while True:
+        if PAUSE_TRADING_ON_NETWORK:
+            # 네트워크 이슈로 인해 트레이딩이 일시중지된 상태입니다.
+            raise RuntimeError("Trading paused due to repeated network/SSL failures")
         try:
-            return fn(*args, **kwargs)
+            res = fn(*args, **kwargs)
+            # 성공하면 실패 카운터 리셋
+            if NETWORK_FAILURES != 0:
+                NETWORK_FAILURES = 0
+                if PAUSE_TRADING_ON_NETWORK:
+                    PAUSE_TRADING_ON_NETWORK = False
+                    logger.info("네트워크 복구 감지: 거래 재개")
+            return res
         except Exception as e:
             attempt += 1
+            is_ssl = False
+            try:
+                import ssl as _ssl
+                if isinstance(e, _ssl.SSLError):
+                    is_ssl = True
+            except Exception:
+                pass
+            # 문자열에 SSLError 표시가 있는 경우도 체크
+            if not is_ssl and isinstance(e, Exception) and ('SSLEOFError' in str(e) or 'SSL' in str(e) or 'ssl' in str(e).lower()):
+                is_ssl = True
+
+            if is_ssl:
+                NETWORK_FAILURES += 1
+                logger.warning(f"with_retry: SSL/네트워크 실패 감지 (count={NETWORK_FAILURES}) - {e}")
+                if NETWORK_FAILURES >= NETWORK_FAILURE_THRESHOLD:
+                    PAUSE_TRADING_ON_NETWORK = True
+                    logger.error(f"네트워크 오류가 {NETWORK_FAILURES}회 발생하여 트레이딩을 일시중지합니다. 수동 확인 필요." )
+
             if attempt > retries:
                 logger.error(f"with_retry: 함수 {fn.__name__} 실패 after {attempt} attempts: {e}")
                 raise
+
             sleep_time = backoff_factor * (2 ** (attempt - 1))
             logger.warning(f"with_retry: {fn.__name__} 실패(시도 {attempt}/{retries}), {e} — {sleep_time:.1f}s 후 재시도")
             time.sleep(sleep_time)
@@ -758,17 +794,38 @@ class GridBotManager:
         
         try:
             while True:
+                # 네트워크 일시중지 플래그가 켜져 있으면 주기적으로 네트워크 상태를 검사
+                if PAUSE_TRADING_ON_NETWORK:
+                    logger.warning("네트워크 이슈로 인해 트레이딩 일시중지 상태입니다. 네트워크 복구를 대기합니다...")
+                    # 간단한 복구 체크: markets 엔드포인트 확인
+                    try:
+                        import requests
+                        r = requests.get('https://api.upbit.com/v1/markets', timeout=5)
+                        if r.status_code == 200:
+                            # 복구로 간주
+                            global NETWORK_FAILURES
+                            NETWORK_FAILURES = 0
+                            logger.info("네트워크 복구 감지: 트레이딩 재개")
+                            # 재개
+                            # fallthrough to normal loop
+                        else:
+                            logger.warning(f"복구 체크 실패 상태코드: {r.status_code}")
+                    except Exception as e:
+                        logger.warning(f"복구 체크 중 오류: {e}")
+                    time.sleep(NETWORK_PAUSE_SLEEP_SECS)
+                    continue
+
                 for bot in self.bots:
                     try:
                         bot.run_cycle()
                         time.sleep(API_CALL_INTERVAL)
                     except Exception as e:
                         logger.error(f"[{bot.coin}] 사이클 오류: {e}")
-                
+
                 if datetime.now() - last_report_time > timedelta(hours=1):
                     self.send_report()
                     last_report_time = datetime.now()
-                
+
                 time.sleep(10)
         
         except KeyboardInterrupt:
