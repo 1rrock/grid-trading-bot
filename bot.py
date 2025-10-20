@@ -9,6 +9,7 @@ from decimal import Decimal, ROUND_DOWN
 from typing import Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 import openai
+import ast
 
 # 환경 변수 로드
 load_dotenv()
@@ -23,6 +24,19 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# --- 로그 포맷 헬퍼 -------------------------------------------------
+def format_order_short(result: Dict) -> str:
+    try:
+        price = int(result.get('price')) if result.get('price') else None
+        volume = float(result.get('volume')) if result.get('volume') else None
+        uuid = result.get('uuid')
+        locked = result.get('locked') or result.get('reserved_fee') or 0
+        return f"uuid={uuid} | price={price:,}원 | vol={volume:.6f} | locked={float(locked):,.2f}원"
+    except Exception:
+        return str(result)
+
+# -------------------------------------------------------------------
 
 # 설정
 UPBIT_ACCESS_KEY = os.getenv('UPBIT_ACCESS_KEY')
@@ -39,23 +53,32 @@ COIN_CONFIGS = {
         'range': 0.04,  # 4% (좁게)
         'grids': 4,     # 4개 (27만원 테스트용으로 줄임)
         'portion': 0.5,  # 50%
-        'min_order': 3000  # 27만원 테스트용으로 낮춤
+        'min_order': 5000  # Upbit 최소 주문 5,000원으로 설정
     },
     'BTC': {
         'range': 0.03,  # 3%
         'grids': 2,     # 2개 (27만원 테스트용으로 줄임)
         'portion': 0.3,  # 30%
-        'min_order': 5000  # 27만원 테스트용으로 낮춤
+        'min_order': 5000
     },
     'ETH': {
         'range': 0.03,  # 3%
         'grids': 2,     # 2개 (27만원 테스트용으로 줄임)
         'portion': 0.2,  # 20%
-        'min_order': 5000  # 27만원 테스트용으로 낮춤
+        'min_order': 5000
     }
 }
 API_CALL_INTERVAL = 0.2
 REINVEST_THRESHOLD = 30000
+# 주문 TTL(시간) - 이 시간이 지나면 미체결 주문을 자동 취소하고 재배치할 수 있습니다.
+ORDER_TTL_HOURS = int(os.getenv('ORDER_TTL_HOURS', '12'))  # 기본 12시간
+# 미체결 주문의 잔여를 시장가로 채울지 여부 (리스크 있음)
+FILL_REMAINING_MARKET = os.getenv('FILL_REMAINING_MARKET', 'false').lower() in ('1', 'true', 'yes')
+# 시장가로 잔여를 채울 때 허용하는 최대 잔여 비율(원래 주문량 대비). 예: 0.5 = 잔여가 50% 이하일 때만 시장가로 채움
+MARKET_FILL_IF_LESS_THAN_RATIO = float(os.getenv('MARKET_FILL_IF_LESS_THAN_RATIO', '0.5'))
+# 옵션: 초기화시(또는 주기적으로) 모든 그리드에 지정매수 주문을 미리 걸 것인지 여부
+# True면 그리드 개수만큼 모든 매수 주문을 걸어둡니다. False면 기존 동작(현재가 > 그리드 가격인 경우에만).
+PREPLACE_ALL_GRIDS = False
 
 def log_trade_event(event_type: str, details: Dict):
     try:
@@ -67,27 +90,156 @@ def log_trade_event(event_type: str, details: Dict):
 
 def send_discord_notification(message: str, color: int = 3447003):
     try:
-        data = {"embeds": [{"title": "🤖 그리드 트레이딩 봇", "description": message, "color": color, "timestamp": datetime.utcnow().isoformat()}]}
+        # 최근 로그를 파일에서 읽어 요약으로 포함
+        def get_recent_logs(path: str, lines: int = 20, max_chars: int = 1000) -> str:
+            try:
+                if not os.path.exists(path):
+                    return ''
+                with open(path, 'r', encoding='utf-8') as f:
+                    all_lines = f.read().splitlines()
+                recent = all_lines[-lines:]
+                # 전처리: 불필요한 길이 긴 dict 응답을 요약 형식으로 변환
+                pretty_lines = []
+                for ln in recent:
+                    ln_strip = ln.strip()
+                    # 이미 정리된 ORDER 로그는 그대로 사용
+                    if ln_strip.startswith('[ORDER]'):
+                        pretty_lines.append(ln_strip)
+                        continue
+
+                    # Upbit 응답이 로깅된 경우 (예: BUY_LIMIT_ORDER_RESPONSE - KRW-XRP: {...})
+                    if 'BUY_LIMIT_ORDER_RESPONSE -' in ln_strip or 'BUY_LIMIT_ORDER_RESPONSE -' in ln_strip:
+                        try:
+                            # 딕셔너리 문자열 추출
+                            parts = ln_strip.split(':', 1)
+                            if len(parts) > 1:
+                                dict_str = parts[1].strip()
+                                # 안전하게 파싱
+                                parsed = ast.literal_eval(dict_str)
+                                pretty_lines.append(format_order_short(parsed))
+                                continue
+                        except Exception:
+                            pass
+
+                    # 기타 BUY/SELL raw response 패턴
+                    if 'BUY_LIMIT_ORDER_RESPONSE' in ln_strip or 'SELL_LIMIT_ORDER_RESPONSE' in ln_strip:
+                        try:
+                            dict_start = ln_strip.find('{')
+                            if dict_start != -1:
+                                parsed = ast.literal_eval(ln_strip[dict_start:])
+                                pretty_lines.append(format_order_short(parsed))
+                                continue
+                        except Exception:
+                            pass
+
+                    # 기본으로는 원문 유지(짧게)
+                    pretty_lines.append(ln_strip)
+
+                text = '\n'.join(pretty_lines)
+                if len(text) > max_chars:
+                    return text[-max_chars:]
+                return text
+            except Exception:
+                return ''
+
+        recent_logs = get_recent_logs('grid_bot.log', lines=20, max_chars=1500)
+        if recent_logs:
+            # embed description에 길이 제한이 있으므로 요약 형식으로 추가
+            description = f"{message}\n\n최근 로그(마지막 {min(20, len(recent_logs.splitlines()))}줄):\n```text\n{recent_logs}\n```"
+        else:
+            description = message
+
+        data = {"embeds": [{"title": "🤖 그리드 트레이딩 봇", "description": description, "color": color, "timestamp": datetime.utcnow().isoformat()}]}
+        # 웹훅이 설정되어 있는지 확인
+        if not DISCORD_WEBHOOK_URL:
+            logger.warning("DISCORD_WEBHOOK_URL 미설정: 디스코드 알림을 건너뜁니다.")
+            return
         requests.post(DISCORD_WEBHOOK_URL, json=data, timeout=5)
     except Exception as e:
         logger.error(f"디스코드 알림 실패: {e}")
 
 def execute_buy_limit_order(upbit, ticker, price, volume):
     try:
+        logger.info(f"BUY_LIMIT_ORDER_ATTEMPT - {ticker}: 가격 {price:,.0f}원, 수량 {volume:.8f}")
+        
+        # 업비트 최소 주문 금액 적용 (기본 5,000원)
+        min_order_value = MIN_ORDER_AMOUNT if MIN_ORDER_AMOUNT else 5000
+        order_value = price * volume
+        if order_value < min_order_value:
+            logger.warning(f"BUY_LIMIT_REJECTED - {ticker}: 주문 금액이 너무 작음 ({order_value:.0f}원 < {min_order_value}원)")
+            return None
+            
         result = upbit.buy_limit_order(ticker, price, volume)
+        logger.info(f"BUY_LIMIT_ORDER_RESPONSE - {ticker}: {result}")
+        
         if result and 'uuid' in result:
-            logger.info(f"BUY_LIMIT - {ticker}: {price:,.0f}원 x {volume:.6f}")
+            # 깔끔한 요약 로그 출력
+            try:
+                locked = result.get('locked') or result.get('reserved_fee') or 0
+                logger.info(f"[ORDER][BUY] {ticker} | price={int(result.get('price')):,}원 | volume={float(result.get('volume')):.6f} | locked={float(locked):,.2f}원 | uuid={result.get('uuid')}")
+            except Exception:
+                logger.info(f"BUY_LIMIT_SUCCESS - {ticker}: {price:,.0f}원 x {volume:.6f}")
             return result
-        return None
+        elif result and 'error' in result:
+            logger.error(f"BUY_LIMIT_API_ERROR - {ticker}: {result['error']}")
+            return None
+        else:
+            logger.warning(f"BUY_LIMIT_INVALID_RESPONSE - {ticker}: {result}")
+            return None
+            
     except Exception as e:
-        logger.error(f"BUY_LIMIT_ERROR - {ticker}: {e}")
+        logger.error(f"BUY_LIMIT_EXCEPTION - {ticker}: {str(e)}")
         return None
+
+def cancel_order_safe(upbit, uuid):
+    try:
+        return upbit.cancel_order(uuid)
+    except Exception as e:
+        logger.warning(f"cancel_order_safe 실패: {e}")
+        return None
+
+def cancel_stale_orders(self):
+    """미체결 주문 TTL을 검사하고 오래된 주문을 취소합니다."""
+    try:
+        now = datetime.now()
+        to_cancel = []
+        for uuid, meta in list(self.pending_orders.items()):
+            created = meta.get('created_at')
+            if not created:
+                continue
+            if now - created > timedelta(hours=ORDER_TTL_HOURS):
+                to_cancel.append((uuid, meta))
+
+        for uuid, meta in to_cancel:
+            logger.info(f"[{self.coin}] 오래된 주문 취소: uuid={uuid}, age={(now - meta.get('created_at')).total_seconds()/3600:.1f}h")
+            cancel_order_safe(self.upbit, uuid)
+            # 주문 취소 후 pending 제거 및 grid 상태 초기화
+            grid_index = meta.get('grid_index')
+            side = meta.get('side')
+            if grid_index is not None and grid_index < len(self.grids):
+                grid = self.grids[grid_index]
+                if side == 'buy' and grid.get('buy_order_uuid') == uuid:
+                    grid['buy_order_uuid'] = None
+                if side == 'sell' and grid.get('sell_order_uuid') == uuid:
+                    grid['sell_order_uuid'] = None
+
+            try:
+                del self.pending_orders[uuid]
+            except KeyError:
+                pass
+            time.sleep(API_CALL_INTERVAL)
+    except Exception as e:
+        logger.error(f"[{self.coin}] cancel_stale_orders 실패: {e}")
 
 def execute_sell_limit_order(upbit, ticker, price, volume):
     try:
         result = upbit.sell_limit_order(ticker, price, volume)
         if result and 'uuid' in result:
-            logger.info(f"SELL_LIMIT - {ticker}: {price:,.0f}원 x {volume:.6f}")
+            try:
+                locked = result.get('locked') or result.get('reserved_fee') or 0
+                logger.info(f"[ORDER][SELL] {ticker} | price={int(result.get('price')):,}원 | volume={float(result.get('volume')):.6f} | locked={float(locked):,.2f}원 | uuid={result.get('uuid')}")
+            except Exception:
+                logger.info(f"SELL_LIMIT - {ticker}: {price:,.0f}원 x {volume:.6f}")
             return result
         return None
     except Exception as e:
@@ -98,7 +250,7 @@ def execute_sell_market_order(upbit, ticker, volume):
     try:
         result = upbit.sell_market_order(ticker, volume)
         if result and 'uuid' in result:
-            logger.info(f"SELL_MARKET - {ticker}: {volume:.6f}개")
+            logger.info(f"[ORDER][SELL_MARKET] {ticker} | volume={float(result.get('volume')):.6f} | uuid={result.get('uuid')}")
             return result
         return None
     except Exception as e:
@@ -110,8 +262,35 @@ def is_peak_time():
     return (9 <= hour <= 11) or (21 <= hour <= 23)
 
 def round_price(price: float, coin: str) -> float:
-    price_unit = COIN_CONFIGS.get(coin, {}).get('price_unit', 1)
-    return round(price / price_unit) * price_unit
+    """업비트 가격 단위에 맞춰 가격을 반올림합니다.
+
+    단위 기준(예상):
+    - price < 10,000: 1
+    - 10,000 <= price < 100,000: 5
+    - 100,000 <= price < 500,000: 10
+    - 500,000 <= price < 1,000,000: 50
+    - 1,000,000 <= price < 2,000,000: 100
+    - 2,000,000 <= price < 5,000,000: 500
+    - price >= 5,000,000: 1000
+    """
+    p = float(price)
+    if p < 10000:
+        tick = 1
+    elif p < 100000:
+        tick = 5
+    elif p < 500000:
+        tick = 10
+    elif p < 1000000:
+        tick = 50
+    elif p < 2000000:
+        tick = 100
+    elif p < 5000000:
+        tick = 500
+    else:
+        tick = 1000
+
+    # 반올림하여 tick 단위로 맞춤
+    return int(round(p / tick) * tick)
 
 class GridTradingBot:
     def __init__(self, upbit, coin: str, capital_per_coin: float, manager=None, portion=0.0):
@@ -395,58 +574,132 @@ class GridTradingBot:
             for i, grid in enumerate(self.grids[:-1]):
                 buy_price = grid['price']
                 sell_price = self.grids[i + 1]['price']
-                
-                if current_price > buy_price and not grid['has_position'] and not grid['buy_order_uuid']:
-                    amount_per_grid = self.capital / self.grid_count
-                    if amount_per_grid >= self.min_order_amount and available_balance >= amount_per_grid:
-                        volume = amount_per_grid / buy_price
-                        volume = float(Decimal(str(volume)).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN))
-                        result = execute_buy_limit_order(self.upbit, self.market, buy_price, volume)
-                        if result and 'uuid' in result:
-                            grid['buy_order_uuid'] = result['uuid']
-                            self.pending_orders[result['uuid']] = {'grid_index': i, 'side': 'buy'}
-                            available_balance -= amount_per_grid
-                        time.sleep(API_CALL_INTERVAL)
+
+                # 그리드별 매수 주문 여부 결정
+                if PREPLACE_ALL_GRIDS:
+                    place_buy = (not grid['has_position'] and not grid['buy_order_uuid'])
+                else:
+                    place_buy = (current_price > buy_price and not grid['has_position'] and not grid['buy_order_uuid'])
+
+                if not place_buy:
+                    # 로깅: 왜 스킵했는지 간단히 기록
+                    if grid['has_position']:
+                        logger.debug(f"[{self.coin}] 그리드 {i} 스킵: 이미 포지션 보유")
+                    elif grid['buy_order_uuid']:
+                        logger.debug(f"[{self.coin}] 그리드 {i} 스킵: 이미 주문 존재 (uuid={grid['buy_order_uuid']})")
+                    else:
+                        logger.debug(f"[{self.coin}] 그리드 {i} 스킵: 가격 조건 미충족 (current={current_price:,.0f}, grid={buy_price:,.0f})")
+                    continue
+
+                amount_per_grid = self.capital / self.grid_count
+                if amount_per_grid < self.min_order_amount:
+                    logger.info(f"[{self.coin}] 그리드 {i} 매수 스킵: 그리드당 금액 {amount_per_grid:,.0f}원 < 최소주문 {self.min_order_amount:,.0f}원")
+                    continue
+
+                if available_balance < amount_per_grid:
+                    logger.info(f"[{self.coin}] 그리드 {i} 매수 스킵: 잔고 부족 ({available_balance:,.0f}원 < 필요 {amount_per_grid:,.0f}원)")
+                    continue
+
+                volume = amount_per_grid / buy_price
+                volume = float(Decimal(str(volume)).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN))
+                result = execute_buy_limit_order(self.upbit, self.market, buy_price, volume)
+                if result and 'uuid' in result:
+                    grid['buy_order_uuid'] = result['uuid']
+                    # pending metadata: created time and expected volume
+                    self.pending_orders[result['uuid']] = {'grid_index': i, 'side': 'buy', 'created_at': datetime.now(), 'expected_volume': volume}
+                    available_balance -= amount_per_grid
+                    logger.info(f"[{self.coin}] 그리드 {i} 지정매수 주문 배치: price={buy_price:,.0f}, amount={amount_per_grid:,.0f}원")
+                else:
+                    logger.warning(f"[{self.coin}] 그리드 {i} 지정매수 주문 실패: price={buy_price:,.0f}, volume={volume:.8f}, result={result}")
+                time.sleep(API_CALL_INTERVAL)
                 
                 if grid['has_position'] and grid['volume'] > 0 and not grid['sell_order_uuid']:
                     result = execute_sell_limit_order(self.upbit, self.market, sell_price, grid['volume'])
                     if result and 'uuid' in result:
                         grid['sell_order_uuid'] = result['uuid']
-                        self.pending_orders[result['uuid']] = {'grid_index': i, 'side': 'sell'}
+                        self.pending_orders[result['uuid']] = {'grid_index': i, 'side': 'sell', 'created_at': datetime.now(), 'expected_volume': grid['volume']}
                     time.sleep(API_CALL_INTERVAL)
         except Exception as e:
             logger.error(f"[{self.coin}] 주문 배치 실패: {e}")
     
     def check_filled_orders(self):
         try:
+            # 오래된 주문 자동 취소 먼저 실행
+            cancel_stale_orders(self)
+
             open_orders = self.upbit.get_order(self.market, state='wait')
             if open_orders is None:
                 open_orders = []
-            
+
             open_order_uuids = {order['uuid'] for order in open_orders}
             filled_uuids = set(self.pending_orders.keys()) - open_order_uuids
-            
+
             for uuid in list(filled_uuids):
-                order_info = self.pending_orders[uuid]
-                grid_index = order_info['grid_index']
-                side = order_info['side']
-                
-                if grid_index >= len(self.grids):
-                    del self.pending_orders[uuid]
+                order_info = self.pending_orders.get(uuid, {})
+                grid_index = order_info.get('grid_index')
+                side = order_info.get('side')
+                expected_volume = float(order_info.get('expected_volume') or 0)
+
+                if grid_index is None or grid_index >= len(self.grids):
+                    try:
+                        del self.pending_orders[uuid]
+                    except KeyError:
+                        pass
                     continue
-                
+
                 grid = self.grids[grid_index]
-                
-                if side == 'buy' and grid['buy_order_uuid'] == uuid:
-                    amount_per_grid = self.capital / self.grid_count
-                    volume = amount_per_grid / grid['price']
-                    grid['has_position'] = True
-                    grid['volume'] += volume
-                    grid['buy_price'] = grid['price']
-                    grid['buy_order_uuid'] = None
-                    logger.info(f"[{self.coin}] ✅ 매수 체결: {grid['price']:,.0f}원")
-                
-                elif side == 'sell' and grid['sell_order_uuid'] == uuid:
+
+                if side == 'buy' and grid.get('buy_order_uuid') == uuid:
+                    # 부분체결 처리: 가능한 경우 주문 상세에서 executed_volume 조회
+                    executed_volume = None
+                    try:
+                        # some pyupbit versions allow querying by uuid; wrap in try
+                        detail = None
+                        try:
+                            detail = self.upbit.get_order(uuid)
+                        except Exception:
+                            detail = None
+
+                        if detail and isinstance(detail, dict):
+                            executed_volume = float(detail.get('executed_volume') or detail.get('executed_units') or 0)
+                    except Exception:
+                        executed_volume = None
+
+                    # fallback to expected_volume if no detail
+                    if not executed_volume:
+                        executed_volume = expected_volume
+
+                    try:
+                        if executed_volume and executed_volume > 0:
+                            grid['has_position'] = True
+                            grid['volume'] += executed_volume
+                            grid['buy_price'] = grid['price']
+                            grid['buy_order_uuid'] = None
+                            logger.info(f"[{self.coin}] ✅ 매수 체결(부분/전체 반영): {grid['price']:,.0f}원 | 체결량: {executed_volume:.6f}")
+
+                            # 잔여가 있고 옵션 활성화 시 시장가로 잔여 채움 시도
+                            if FILL_REMAINING_MARKET and expected_volume and executed_volume < expected_volume:
+                                remaining = expected_volume - executed_volume
+                                if remaining / expected_volume <= MARKET_FILL_IF_LESS_THAN_RATIO:
+                                    logger.info(f"[{self.coin}] 잔여량 시장가 채움 시도: remaining={remaining:.8f}")
+                                    morder = None
+                                    try:
+                                        morder = self.upbit.buy_market_order(self.market, remaining)
+                                    except Exception as e:
+                                        logger.warning(f"[{self.coin}] 시장가 잔여 매수 실패: {e}")
+
+                                    if morder:
+                                        grid['volume'] += remaining
+                                        logger.info(f"[{self.coin}] 잔여량 시장가 매수 완료: {remaining:.8f}")
+                                    else:
+                                        logger.warning(f"[{self.coin}] 잔여량 시장가 매수 실패: remaining={remaining:.8f}")
+                        else:
+                            grid['buy_order_uuid'] = None
+                            logger.info(f"[{self.coin}] 매수 주문 체결됨(체결량 확인 불가) uuid={uuid}")
+                    except Exception as e:
+                        logger.error(f"[{self.coin}] 매수 체결 반영 실패: {e}")
+
+                elif side == 'sell' and grid.get('sell_order_uuid') == uuid:
                     if grid_index + 1 < len(self.grids):
                         sell_price = self.grids[grid_index + 1]['price']
                         profit = (sell_price - grid['buy_price']) * grid['volume']
@@ -455,13 +708,16 @@ class GridTradingBot:
                         self.trade_count += 1
                         logger.info(f"[{self.coin}] ✅ 매도 체결: {sell_price:,.0f}원 | 수익: +{net_profit:,.0f}원")
                         send_discord_notification(f"**{self.coin} 매도 체결! 💰**\n• 수익: +{net_profit:,.0f}원\n• 누적: {self.total_profit:,.0f}원\n• 거래: {self.trade_count}회", color=3066993)
-                    
+
                     grid['has_position'] = False
                     grid['volume'] = 0.0
                     grid['buy_price'] = 0.0
                     grid['sell_order_uuid'] = None
-                
-                del self.pending_orders[uuid]
+
+                try:
+                    del self.pending_orders[uuid]
+                except KeyError:
+                    pass
         except Exception as e:
             logger.error(f"[{self.coin}] 체결 확인 실패: {e}")
     
@@ -523,7 +779,7 @@ class GridTradingBot:
             total_balance = sum(bot.capital for bot in self.manager.bots)
             target_capital = total_balance * self.portion
             
-            if abs(self.capital - target_capital) > self.min_order * 10:  # 최소 조정 금액
+            if abs(self.capital - target_capital) > self.min_order_amount * 10:  # 최소 조정 금액
                 if self.capital > target_capital:
                     # 자본이 많으면 매도
                     excess = self.capital - target_capital
@@ -605,11 +861,38 @@ class GridTradingBot:
             if not current_price:
                 return
             
-            # 현재 가격이 가장 낮은 그리드보다 2% 이상 낮으면 추가 그리드 생성
-            if self.grids and current_price < self.grids[-1]['price'] * 0.98:
-                # 새로운 그리드 가격 계산 (2% 간격으로 하락)
-                new_grid_price = self.grids[-1]['price'] * 0.98
+            # 현재 가격이 하단 가격보다 5% 이상 낮으면 추가 그리드 생성
+            if self.lower_price and current_price < self.lower_price * 0.95:
+                # 잔고 확인
+                balances = self.upbit.get_balances()
+                available_balance = 0
+                for balance in balances:
+                    if balance['currency'] == 'KRW':
+                        available_balance = float(balance['balance'])
+                        break
+                
+                logger.info(f"[{self.coin}] 워터폴 그리드 잔고 확인: {available_balance:,.0f}원")
+                
+                # 새로운 그리드 가격 계산 (현재 가격보다 2% 낮게)
+                new_grid_price = current_price * 0.98
+                # 최소 가격 단위로 반올림
+                new_grid_price = round_price(new_grid_price, self.coin)
                 new_grid_index = len(self.grids)
+                
+                # 새로운 그리드에 필요한 금액 계산
+                temp_grid_count = self.grid_count + 1
+                amount_per_grid = self.capital / temp_grid_count
+                
+                logger.info(f"[{self.coin}] 워터폴 그리드 계산: 현재가 {current_price:,.0f}원, 새그리드가격 {new_grid_price:,.0f}원, 금액 {amount_per_grid:,.0f}원, 최소주문 {self.min_order_amount:,.0f}원")
+                
+                # 최소 주문 금액 및 잔고 확인
+                if amount_per_grid < self.min_order_amount:
+                    logger.info(f"[{self.coin}] 워터폴 그리드 추가 취소: 최소 주문 금액 미달 ({amount_per_grid:,.0f} < {self.min_order_amount:,.0f})")
+                    return
+                    
+                if available_balance < amount_per_grid:
+                    logger.info(f"[{self.coin}] 워터폴 그리드 추가 취소: 잔고 부족 ({available_balance:,.0f} < {amount_per_grid:,.0f})")
+                    return
                 
                 # 새로운 그리드 추가
                 new_grid = {
@@ -626,11 +909,19 @@ class GridTradingBot:
                 self.grid_count += 1
                 
                 # 새로운 그리드에 매수 주문
-                amount_per_grid = self.capital / self.grid_count
                 volume = amount_per_grid / new_grid_price
+                volume = float(Decimal(str(volume)).quantize(Decimal('0.00000001'), rounding=ROUND_DOWN))
                 
-                order = self.upbit.buy_limit_order(self.market, new_grid_price, volume)
-                if order:
+                # 최소 수량 제한 적용
+                min_volume = self.min_order_amount / new_grid_price
+                if volume < min_volume:
+                    volume = min_volume
+                    logger.info(f"[{self.coin}] 최소 수량으로 조정: {volume:.8f}")
+                
+                logger.info(f"[{self.coin}] 워터폴 그리드 주문 시도: 가격 {new_grid_price:,.0f}원, 수량 {volume:.8f}")
+                
+                order = execute_buy_limit_order(self.upbit, self.market, new_grid_price, volume)
+                if order and 'uuid' in order:
                     new_grid['buy_order_uuid'] = order['uuid']
                     self.pending_orders[order['uuid']] = {
                         'grid_index': new_grid_index,
@@ -639,8 +930,13 @@ class GridTradingBot:
                         'volume': volume
                     }
                     
-                    logger.info(f"[{self.coin}] 워터폴 그리드 추가: {new_grid_price:,.0f}원 (총 {self.grid_count}개)")
-                    send_discord_notification(f"**{self.coin} 워터폴 그리드 추가! 🌊**\n• 가격: {new_grid_price:,.0f}원\n• 총 그리드: {self.grid_count}개", color=1752220)
+                    logger.info(f"[{self.coin}] 워터폴 그리드 추가 성공: {new_grid_price:,.0f}원 (총 {self.grid_count}개)")
+                    send_discord_notification(f"**{self.coin} 워터폴 그리드 추가! 🌊**\n• 현재가: {current_price:,.0f}원\n• 새 그리드: {new_grid_price:,.0f}원\n• 총 그리드: {self.grid_count}개", color=1752220)
+                else:
+                    # 주문 실패 시 그리드 제거
+                    self.grids.pop()
+                    self.grid_count -= 1
+                    logger.warning(f"[{self.coin}] 워터폴 그리드 주문 실패로 그리드 제거")
                     
         except Exception as e:
             logger.error(f"[{self.coin}] 워터폴 그리드 추가 실패: {e}")
