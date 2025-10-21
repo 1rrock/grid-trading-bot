@@ -1,0 +1,5 @@
+pyupbit
+numpy
+openai
+requests
+python-dotenv
